@@ -16,3 +16,5 @@ falling off to the cooled terminator temperature when the terminator is cooled.
 - Noise temperature of back of amplifier 
 - How leakage and cavity phase shift affects asymmetry in the noise power spectrum
 
+
+Currently working on cav_and_circ_tests: noise temperature plots of blue circuit
