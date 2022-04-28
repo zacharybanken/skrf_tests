@@ -4,6 +4,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 import math
 from pathlib import Path
+import os.path
+import pandas as pd
+from scipy.interpolate import interp1d
+from skrf.constants import K_BOLTZMANN
+
 
 ### Ideal attenuator
 def create_ideal_atten(freq, atten_dB):
@@ -349,3 +354,223 @@ def RT2Cryo(nwk):
     return nwk
 
 
+### Added
+
+###############################
+##### Component Functions   ###
+###############################
+#(From Jihee's components.py and analyis_run1C_tsys.py)
+
+def pow_to_dbm(x):
+    return 10*np.log(x/1e-3)
+def db_to_power_ratio(x):
+    return 10**(x/10)
+
+def dBm_to_W(p_dBm):
+    return 10**(p_dBm/10)/1000
+def power_in_dBm_per_Hz_to_temp(p):
+    return dBm_to_W(p)/K_BOLTZMANN
+
+### Function to read network in noisy environment ###
+def read_in_noisy_network(ntw,freq_interp,Tphys):
+    ntw_interp = ntw.interpolate(freq_interp, kind='cubic')
+    ntw_interp_noisy = rf.NoisyNetwork(ntw_interp)
+    ntw_interp_noisy.noise_source(source='passive',T0 = Tphys)
+
+    return ntw_interp_noisy
+
+### Function to make coaxial cable with coaxial line and SMA connector sample ###
+def make_coax_cable(c_type,freq,len_m,Tphys):
+        
+    if c_type=='RG405U':
+        ntw_coax_RT = cable_RG405U(freq,len_m)
+        ntw_coax_cryo = RT2Cryo(ntw_coax_RT)
+        # ntw_coax_cryo = ntw_coax_RT
+        # ntw_SMA_RT = cmp.cable_RG405U(freq,0.04)
+        ntw_SMA_RT = SMA_RG405U(freq,0.015)
+        ntw_SMA_cryo = RT2Cryo(ntw_SMA_RT)
+        # ntw_SMA_cryo = ntw_SMA_RT
+    elif c_type=='PESR405FL':    
+        ntw_coax_RT = cable_PESR405FL(freq,len_m)
+        ntw_coax_cryo = RT2Cryo(ntw_coax_RT)
+        # ntw_coax_cryo = ntw_coax_RT
+        # ntw_SMA_RT = cmp.cable_PESR405FL(freq,0.04)
+        ntw_SMA_RT = SMA_PESR405FL(freq,0.015)
+        ntw_SMA_cryo = RT2Cryo(ntw_SMA_RT)
+        # ntw_SMA_cryo = ntw_SMA_RT
+    elif c_type=='NbTi085':
+        ntw_coax_cryo = cable_NbTi085(freq,len_m)
+        ntw_SMA_cryo = cable_NbTi085(freq,0.015)
+    else:
+        print('Error: Proper cable type is missing')
+
+    noisy_ntw_coax = read_in_noisy_network(ntw_coax_cryo,freq,Tphys)
+    noisy_ntw_SMA = read_in_noisy_network(ntw_SMA_cryo, freq, Tphys)
+    
+    assmb_cable = rf.MultiNoisyNetworkSystem()
+
+    noisy_ntw_SMA.add_noise_polar(1e-6, 0.5)
+    assmb_cable.add(noisy_ntw_SMA,'SMA1')
+    assmb_cable.add(noisy_ntw_coax,'coax')
+    noisy_ntw_SMA.add_noise_polar(1e-6, 0.55)
+    assmb_cable.add(noisy_ntw_SMA,'SMA2')
+
+    assmb_cable.connect('SMA1',2, 'coax',1)
+    assmb_cable.connect('coax',2, 'SMA2',1)
+
+    assmb_cable.external_port('SMA1',1,1)
+    assmb_cable.external_port('SMA2',2,2)
+
+    noisy_ntw_cable = assmb_cable.reduce()
+    noisy_ntw_cable = read_in_noisy_network(noisy_ntw_cable,freq,Tphys)
+        
+    return noisy_ntw_cable 
+
+## Paths to files - change to location of amplifier data
+
+ZX60_33LN_NF_loc_PATH = r'./data/amplifier_data/ZX60-33LN-S+NF_DATA.csv'
+AMP_PATH = './data/touchstone_files/amplifiers'
+AMP_NAME = 'ZX60-33LNR-S+_UNIT1_.s2p' #Our amplifier is ZX60-33LN-S+, gain of LNR ~0.1 dB less at 1 Ghz
+
+
+### Code from Jihee ###
+# Creates a function of frequency that returns amplifier noise figure amplitudu
+def gen_ZX60_33LN_S_NF_func(ZX60_33LN_NF_loc):
+    
+    # read in nf data from a csv
+    # convert noise figure in db to amplitude
+    # Make a new column with frequency in GHz
+    # Interpolate noise figure as a function of frequency
+    
+    noise_figure_data2 = pd.read_csv(ZX60_33LN_NF_loc , header = 'infer')
+    noise_figure_data2['NF Amplitude'] = 10**(noise_figure_data2['Noise Figure (5V)']/10)
+    noise_figure_data2['Frequency (GHz)'] = noise_figure_data2['Frequency (MHz)']/1e3
+    NF_Func2 = interp1d(noise_figure_data2['Frequency (GHz)'],noise_figure_data2['NF Amplitude'])#,fill_value=1000) # <- extrapolate ok here?
+    
+    return NF_Func2
+
+def return_ZX60_33LN_params(Amp_path,Amp_name,freq,sat_check=False,vendor=True,Temp=290):
+    
+    # create amplifier from manufacturer's s2p file
+    
+    ZX60_33LN_NF_loc = ZX60_33LN_NF_loc_PATH
+    
+    Tphys = Temp
+    
+    Amp_loc = os.path.join(Amp_path,Amp_name)
+    amp_sparam = rf.Network(Amp_loc)
+    amp_sparam = amp_sparam.interpolate(freq,kind='cubic')
+    amp_sparam  = rf.NoisyNetwork(amp_sparam)
+    amp_sparam.noise_source(source='passive',T0=Tphys) # <-- why do we need this if we are specifying the cs matrix from the datasheet?
+    
+    # generate noise figure function
+    
+    #try:
+    NF_func = gen_ZX60_33LN_S_NF_func(ZX60_33LN_NF_loc)
+    nfig_amplitude = NF_func(freq.f/1e9)
+    #except:
+       # print('error')
+       # return
+    
+    # use noise figure function to specify noise covariance matrix
+    # cs}_ii = k_B T_0 S A S^dagger }_ii (F_i - 1)
+        
+    #Tnoise = rf.NetworkNoiseCov.Tnoise(freq.f,Tphys) # <-- where is this noise temperature used?
+    
+    ## Noise covariance matrix calculation 
+    
+    I = np.identity(np.shape(amp_sparam.s)[1])
+    AS = np.matmul(I,np.conjugate(amp_sparam.s.swapaxes(1,2)))
+    SAS = np.matmul(amp_sparam.s,AS)
+    
+    amp_sparam.cs[:,0,0] = (nfig_amplitude - 1) * K_BOLTZMANN * 290 * SAS[:,0,0]
+    
+    I = np.identity(np.shape(amp_sparam.s)[1])
+    AS = np.matmul(I,np.conjugate(amp_sparam.s.swapaxes(1,2)))
+    SAS = np.matmul(amp_sparam.s,AS)
+    
+    amp_sparam.cs[:,1,1] = (nfig_amplitude-1) * K_BOLTZMANN * 290 * SAS[:,1,1]
+    
+    amp_sparam.cs[:,0,1] = np.zeros_like(amp_sparam.cs[:,1,1])
+    amp_sparam.cs[:,1,0] = amp_sparam.cs[:,0,1]
+    
+    return amp_sparam
+
+
+def create_measured_circulator(freq,s_circ_db):
+    
+    
+    s_circ = 10**(s_circ_db/10)
+
+    s = np.zeros((len(freq),3,3), dtype ="complex_")
+    
+    #Assumes clockwise circulator (1=>2=>3=>1...)
+    s[:,0,0] = s_circ[0,0]
+    s[:,0,1] = s_circ[0,1]
+    s[:,0,2] = s_circ[0,2]
+    s[:,1,0] = s_circ[1,0]
+    s[:,1,1] = s_circ[1,1]
+    s[:,1,2] = s_circ[1,2]
+    s[:,2,0] = s_circ[2,0]
+    s[:,2,1] = s_circ[2,1]
+    s[:,2,2] = s_circ[2,2]
+    
+    ntw_circ = rf.Network(frequency=freq, s=s)
+    
+    return ntw_circ
+
+### code from Professor Rybka ###
+
+#Generate a scikit-rf network for a cavity mode #
+#with resonant frequency f0 and unloaded Q Q0
+#and a list of coupling Qs for ports
+def create_cavity_Qports(freq,f0,Q0,Qports,name='cavity'):
+    
+    Qports=np.array(Qports) #in case its a list    
+    #Follows Ishikawa et al. IEICE Transactions on Electronics, E76-C Issue 6 Pages 925-931 (1993)
+    Qomega=1/(1/Q0+np.sum(1/Qports)+1j*(freq.f/f0-f0/freq.f))    
+    S=np.zeros([len(freq.f),len(Qports),len(Qports)],complex)
+    
+    #this could be made more elegant with np.outer but much less clear
+    
+    for i in range(len(Qports)):
+        for j in range(i,len(Qports)):
+            
+            if i==j: #Diagonal S elements
+                S[:,i,i]=2*Qomega/Qports[i]-1
+                
+            else: #off-diagonal S elements (symmetric)
+                S[:,i,j]=2*Qomega/np.sqrt(Qports[i]*Qports[j])                        
+                S[:,j,i]=S[:,i,j]
+                
+    ntwk = rf.Network(frequency=freq, s=S, name=name)
+    return ntwk
+
+
+def create_circulator_variable_leakage(freq,leakage,reflection):
+    
+    l = leakage
+    g = reflection
+    s_circ_db = np.array([[g,   l,-0.8],
+                          [-0.8,g,   l],
+                          [l, -0.8,  g]])
+    
+    
+    s_circ = 10**(s_circ_db/10)
+
+    s = np.zeros((len(freq),3,3), dtype ="complex_")
+    
+    #Assumes clockwise circulator (1=>2=>3=>1...)
+    s[:,0,0] = s_circ[0,0]
+    s[:,0,1] = s_circ[0,1]
+    s[:,0,2] = s_circ[0,2]
+    s[:,1,0] = s_circ[1,0]
+    s[:,1,1] = s_circ[1,1]
+    s[:,1,2] = s_circ[1,2]
+    s[:,2,0] = s_circ[2,0]
+    s[:,2,1] = s_circ[2,1]
+    s[:,2,2] = s_circ[2,2]
+    
+    ntw_circ = rf.Network(frequency=freq, s=s)
+    
+    return ntw_circ
